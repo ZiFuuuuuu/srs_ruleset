@@ -1,0 +1,66 @@
+name: 自动转换sing-box规则集为srs格式
+on:
+  schedule:
+    # 每3天执行一次（UTC时间0点，对应北京时间8点），如需调整时间可修改cron表达式
+    - cron: '0 0 */3 * *'
+  # 支持手动触发执行，方便测试
+  workflow_dispatch:
+
+permissions:
+  contents: write # 授予仓库写入权限，用于提交生成的srs文件
+
+jobs:
+  convert-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出当前仓库
+        uses: actions/checkout@v4
+
+      - name: 拉取目标仓库的sing-box规则文件夹
+        run: |
+          # 稀疏检出，仅拉取sing-box文件夹，无需克隆整个仓库
+          git clone --filter=blob:none --sparse https://github.com/SukkaLab/ruleset.skk.moe.git temp_rules
+          cd temp_rules
+          git sparse-checkout set sing-box
+          cd ..
+
+      - name: 安装最新版sing-box
+        run: |
+          # 获取sing-box最新稳定版本号
+          SINGBOX_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -Po '"tag_name": "v\K[0-9.]+')
+          # 下载对应Linux版本的sing-box
+          wget -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          # 解压并安装到系统
+          tar -xzf sing-box.tar.gz
+          sudo cp sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box /usr/local/bin/
+          # 验证安装
+          sing-box version
+
+      - name: 批量将json规则集编译为srs格式
+        run: |
+          # 创建存放srs文件的文件夹
+          mkdir -p srs
+          # 遍历所有json文件，批量编译
+          for json_file in temp_rules/sing-box/*.json; do
+            # 获取文件名（不含后缀）
+            filename=$(basename "$json_file" .json)
+            # 执行编译命令，json转srs
+            sing-box rule-set compile --output "srs/${filename}.srs" "$json_file"
+            echo "已编译: ${filename}.json -> ${filename}.srs"
+          done
+
+      - name: 提交生成的srs文件到仓库
+        run: |
+          # 配置git用户信息
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # 添加文件
+          git add srs/
+          # 仅当有变更时才提交
+          if git diff --staged --quiet; then
+            echo "规则无更新，无需提交"
+            exit 0
+          fi
+          # 提交并推送
+          git commit -m "chore: 自动更新sing-box srs规则集 $(date +'%Y-%m-%d')"
+          git push
