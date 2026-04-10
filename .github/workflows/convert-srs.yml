@@ -1,24 +1,28 @@
-name: 自动转换sing-box规则集为srs格式
+name: 自动转换sing-box规则集为srs格式(含定时清理旧任务)
 on:
   schedule:
-    # 每3天执行一次（UTC时间0点，对应北京时间8点），如需调整时间可修改cron表达式
+    # 原有定时：每3天执行规则转换（UTC时间0点，对应北京时间8点）
     - cron: '0 0 */3 * *'
-  # 支持手动触发执行，方便测试
+    # 新增定时：每15天执行一次（同时触发规则转换+旧任务清理）
+    - cron: '0 0 */15 * *'
+  # 手动触发：支持手动执行转换/清理，方便测试
   workflow_dispatch:
 
+# 必须保留的权限：仓库写入+Action操作权限
 permissions:
-  contents: write # 授予仓库写入权限，用于提交生成的srs文件
+  contents: write
+  actions: write
 
 jobs:
+  # 原有核心任务：规则集转换，所有定时/手动触发都会执行
   convert-rules:
     runs-on: ubuntu-latest
     steps:
       - name: 检出当前仓库
         uses: actions/checkout@v4
 
-      - name: 拉取目标仓库的sing-box规则文件夹
+      - name: 拉取目标仓库完整的sing-box目录(含所有子文件夹)
         run: |
-          # 稀疏检出，仅拉取sing-box文件夹，无需克隆整个仓库
           git clone --filter=blob:none --sparse https://github.com/SukkaLab/ruleset.skk.moe.git temp_rules
           cd temp_rules
           git sparse-checkout set sing-box
@@ -26,14 +30,56 @@ jobs:
 
       - name: 安装最新版sing-box
         run: |
-          # 获取sing-box最新稳定版本号
           SINGBOX_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -Po '"tag_name": "v\K[0-9.]+')
-          # 下载对应Linux版本的sing-box
           wget -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
-          # 解压并安装到系统
           tar -xzf sing-box.tar.gz
           sudo cp sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box /usr/local/bin/
-          # 验证安装
+          sing-box version
+
+      - name: 递归转换所有json规则(保留完整目录结构)
+        run: |
+          rm -rf srs
+          mkdir -p srs
+          find temp_rules/sing-box -type f -name "*.json" | while read -r json_file; do
+            srs_file=$(echo "$json_file" | sed -e 's|^temp_rules/sing-box/|srs/|' -e 's/\.json$/.srs/')
+            mkdir -p "$(dirname "$srs_file")"
+            sing-box rule-set compile --output "$srs_file" "$json_file"
+            echo "✅ 转换完成: ${json_file#temp_rules/sing-box/} → ${srs_file#srs/}"
+          done
+
+      - name: 提交更新到仓库
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add srs/
+          if git diff --staged --quiet; then
+            echo "ℹ️ 源仓库规则无更新，无需提交"
+            exit 0
+          fi
+          git commit -m "chore: 自动更新srs规则集 $(date +'%Y-%m-%d')"
+          git push
+
+  # 新增任务：清理10天前的Action旧运行记录
+  clean-old-workflow-runs:
+    runs-on: ubuntu-latest
+    # 触发条件：仅每15天的定时任务 或 手动触发时执行，每3天的常规转换不执行清理
+    if: github.event.schedule == '0 0 */15 * *' || github.event_name == 'workflow_dispatch'
+    # 等待转换任务完成后再执行清理（可选，可直接删除needs行并行执行）
+    needs: convert-rules
+    steps:
+      - name: 删除10天前的Action旧运行记录
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          # 目标仓库：当前仓库，无需修改
+          repository: ${{ github.repository }}
+          # GitHub自动生成的授权令牌，无需手动添加Secret
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # 核心规则：删除10天前的运行记录
+          days_old: 10
+          # 兜底规则：每个工作流至少保留最新的3条记录，避免全量删除
+          keep_minimum_runs: 3
+          # 删除所有已完成/取消/失败的记录，仅保留运行中的
+          delete_runs_by_status: "completed,cancelled,failure"
           sing-box version
 
       - name: 批量将json规则集编译为srs格式
